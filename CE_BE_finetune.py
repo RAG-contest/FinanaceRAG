@@ -14,12 +14,12 @@ import os
 from CustomDataset import FinanceDataset
 from transformersCL import CrossEncoderCL, SentenceTransformerCL
 
-def main():
+def finetune(dataset_name, epoch):
     # Load the dataset
-    ds = load_dataset("Linq-AI-Research/FinanceRAG", "MultiHiertt")
+    ds = load_dataset("Linq-AI-Research/FinanceRAG", dataset_name)
 
     # Load ground truth relevance judgments
-    df = pd.read_csv('gt/MultiHiertt_qrels.tsv', sep='\t')
+    df = pd.read_csv(f'gt/{dataset_name}_qrels.tsv', sep='\t')
 
     # Get all unique query IDs and corpus IDs
     all_queries = df['query_id'].unique()
@@ -50,7 +50,7 @@ def main():
         return None
 
     # Create InputExamples
-    dataset_path = "total_dataset_positive_pair"
+    dataset_path = f"{dataset_name}_positive_pair"
     if os.path.exists(f'preprocessed/{dataset_path}.pkl'):
         print("dataset mapping exist!")
         with open(f'preprocessed/{dataset_path}.pkl', 'rb') as f:
@@ -91,7 +91,7 @@ def main():
         with open(f'preprocessed/{dataset_path}.pkl', 'wb') as f:
             pickle.dump(total_dataset, f)
         print("Done.\n")
-
+    print(len(total_dataset))
     random.shuffle(total_dataset)
 
     def in_batch_collate_fn(batch):
@@ -114,29 +114,30 @@ def main():
     ce_model_name = 'cross-encoder/ms-marco-MiniLM-L-12-v2'  # Or any suitable model
     bi_model_name = 'intfloat/e5-large-v2'
     ce_model = CrossEncoderCL(ce_model_name)
-    bi_model = SentenceTransformerCL(bi_model_name)
 
-    # Define DataLoader and loss function
-    ce_train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=12, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
+    print("started fitting")
+    # Define DataLoader and loss function & Train Model
+    ce_train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=10, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
     ce_train_loss = None#losses.CosineSimilarityLoss(model=model.model)
 
-    bi_train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=12, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn_e5)
+    ce_model.fit(train_dataloader=ce_train_dataloader, epochs=epoch, loss_fct=ce_train_loss, show_progress_bar=True)
+    torch.cuda.empty_cache()
+
+    bi_model = SentenceTransformerCL(bi_model_name)
+    bi_train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=17, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn_e5)
     bi_train_loss = losses.CosineSimilarityLoss(model=bi_model)
 
-    # Train the model
-    print("started fitting")
-    # ce_model.fit(train_dataloader=ce_train_dataloader, epochs=5, loss_fct=ce_train_loss, show_progress_bar=True)
-    bi_model.fit(train_objectives=[(bi_train_dataloader, bi_train_loss)], epochs=5, show_progress_bar=True)
+    bi_model.fit(train_objectives=[(bi_train_dataloader, bi_train_loss)], epochs=epoch, show_progress_bar=True)
 
-    ce_model_name = 'finance_cross_encoder_model_e5_b12'
-    bi_model_name = 'finance_bi_encoder_e5_b12'
-    # ce_model.save(f'outputs/models/{ce_model_name}')
+    ce_model_name = f'{dataset_name}/finance_cross_encoder_model_e{epoch}_b10'
+    bi_model_name = f'{dataset_name}/finance_bi_encoder_e{epoch}_b17'
+    ce_model.save(f'outputs/models/{ce_model_name}')
     bi_model.save(f'outputs/models/{bi_model_name}')
     ce_model = CrossEncoderCL(f'outputs/models/{ce_model_name}')
-        
+    
     # Evaluate on the test set
     print("processing test_data in batch")
-    test_loader = DataLoader(test_dataset, shuffle=True, batch_size=14, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
+    test_loader = DataLoader(test_dataset, shuffle=True, batch_size=10, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
     temp = [batch for batch in tqdm(test_loader)]
     batchs = []
     for batch in temp:
@@ -153,12 +154,22 @@ def main():
     # bi_scores = bi_model.predict(list(zip(test_queries, test_corpus)), show_progress_bar=True)
 
     # Compute evaluation metrics
-    mse = mean_squared_error(test_labels, scores)
-    predicted_labels = [1.0 if score >= 0.5 else 0.0 for score in scores]
+    mse = mean_squared_error(test_labels, ce_scores)
+    predicted_labels = [1.0 if score >= 0.5 else 0.0 for score in ce_scores]
     accuracy = accuracy_score(test_labels, predicted_labels)
 
     print(f'Test MSE: {mse}')
     print(f'Test Accuracy: {accuracy}')
+    del test_dataset, train_dataset, ce_model, bi_model
+
+def main():
+    task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]
+    epoch_num = [10]*4 + [20]*3
+    for name, epoch in zip(task_names, epoch_num):
+        torch.cuda.empty_cache()
+        finetune(name, epoch)
 
 if __name__ == "__main__":
+    os.environ["WANDB_DISABLED"] = "true"
     main()
+    
