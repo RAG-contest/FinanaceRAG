@@ -2,6 +2,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from sentence_transformers import CrossEncoder, InputExample, losses
+from sentence_transformers.evaluation import EmbeddingSimilarityEvaluator
+from sentence_transformers.cross_encoder.evaluation import CEBinaryClassificationEvaluator
 from datasets import load_dataset
 
 import pandas as pd
@@ -12,14 +14,14 @@ import pickle
 import os
 
 from CustomDataset import FinanceDataset
-from CrossEncoderCL import CrossEncoderCL
+from transformersCL import CrossEncoderCL
 
-def main():
+def finetune(dataset_name, epoch):
     # Load the dataset
-    ds = load_dataset("Linq-AI-Research/FinanceRAG", "MultiHiertt")
+    ds = load_dataset("Linq-AI-Research/FinanceRAG", dataset_name)
 
     # Load ground truth relevance judgments
-    df = pd.read_csv('gt/MultiHiertt_qrels.tsv', sep='\t')
+    df = pd.read_csv(f'gt/{dataset_name}_qrels.tsv', sep='\t')
 
     # Get all unique query IDs and corpus IDs
     all_queries = df['query_id'].unique()
@@ -50,7 +52,7 @@ def main():
         return None
 
     # Create InputExamples
-    dataset_path = "total_dataset_positive_pair"
+    dataset_path = f"{dataset_name}_positive_pair"
     if os.path.exists(f'preprocessed/{dataset_path}.pkl'):
         print("dataset mapping exist!")
         with open(f'preprocessed/{dataset_path}.pkl', 'rb') as f:
@@ -98,33 +100,47 @@ def main():
         new_batch = [InputExample(texts=[batch[i][0], batch[j][1]], label=float(batch[j][3] not in get_negative_corpus(batch[i][2]))) for i in range(len(batch)) for j in range(len(batch))]
         return new_batch
 
+    def no_negative_collate_fn(batch):
+        # assume dataset only contains positive pair
+        new_batch = [InputExample(texts=[batch[i][0], batch[i][1]], label=1) for i in range(len(batch))]
+        return new_batch
+
     # Split into train and test sets
     num_data = len(total_dataset)
     train_ratio = 0.8
     train_size = int(train_ratio * num_data)
 
     train_dataset = FinanceDataset(total_dataset[:train_size], all_corpus, get_id_text)
-    test_dataset = FinanceDataset(total_dataset[:train_size], all_corpus, get_id_text, 'test')
+    test_dataset = FinanceDataset(total_dataset[train_size:], all_corpus, get_id_text, 'test')
 
     # Define the model
     model_name = 'cross-encoder/ms-marco-MiniLM-L-12-v2'  # Or any suitable model
     model = CrossEncoderCL(model_name)
 
     # Define DataLoader and loss function
-    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=12, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=128, num_workers=0, pin_memory=True, collate_fn=no_negative_collate_fn) # lets try with no negative pair #, collate_fn=in_batch_collate_fn)
     train_loss = None#losses.CosineSimilarityLoss(model=model.model)
+
+    # Create validation evaluator based on test dataset (flawed since it uses test as validation)
+    queries = [q for q, _, _, _ in test_dataset]
+    corpus = [c for _, c, _, _ in test_dataset]
+    sentence_pair = [(q, c) for q, c, _, _ in test_dataset]
+    scores = [1]*len(queries)
+    evaluator = CEBinaryClassificationEvaluator(sentence_pair, scores) # for cross encoder. scores == labels
+    # evaluator = EmbeddingSimilarityEvaluator(queries, corpus, scores, "cosine") # for bi encoder
 
     # Train the model
     print("started fitting")
-    # model.fit(train_dataloader=train_dataloader, epochs=5, loss_fct=train_loss, show_progress_bar=True)
+    print(len(train_dataloader))
+    model.fit(train_dataloader=train_dataloader, epochs=epoch, loss_fct=train_loss, show_progress_bar=True, evaluator=evaluator, evaluation_steps=len(train_dataloader))
 
-    model_name = 'finance_cross_encoder_model_e5_b10'
-    # model.save(f'outputs/models/{model_name}')
+    model_name = 'only_positive_pair'
+    model.save(f'outputs/models/{model_name}')
     model = CrossEncoderCL(f'outputs/models/{model_name}')
         
     # Evaluate on the test set
     print("processing test_data in batch")
-    test_loader = DataLoader(test_dataset, shuffle=True, batch_size=12, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
+    test_loader = DataLoader(test_dataset, shuffle=True, batch_size=64, num_workers=0, pin_memory=True, collate_fn=in_batch_collate_fn)
     temp = [batch for batch in tqdm(test_loader)]
     batchs = []
     for batch in temp:
@@ -147,5 +163,14 @@ def main():
     print(f'Test MSE: {mse}')
     print(f'Test Accuracy: {accuracy}')
 
+
+def main():
+    task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]
+    epoch_num = [10]*7
+    for name, epoch in zip(task_names, epoch_num):
+        torch.cuda.empty_cache()
+        finetune(name, epoch)
+
 if __name__ == "__main__":
+    os.environ["WANDB_DISABLED"] = "true"
     main()
