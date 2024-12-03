@@ -66,7 +66,7 @@ class CrossEncoderCL(CrossEncoder):
         scheduler: str = "WarmupLinear",
         warmup_steps: int = 10000,
         optimizer_class: type[Optimizer] = torch.optim.AdamW,
-        optimizer_params: dict[str, object] = {"lr": 2e-5},
+        optimizer_params: dict[str, object] = {"lr": 1e-5},
         weight_decay: float = 0.01,
         evaluation_steps: int = 0,
         output_path: str = None,
@@ -223,6 +223,57 @@ if is_datasets_available():
     from datasets import Dataset, DatasetDict
 
 from sentence_transformers.fit_mixin import EvaluatorCallback
+
+class SaveModelCallback(TrainerCallback):
+    """A Callback to save the model to the `output_dir`.
+
+    There are two cases:
+    1. save_best_model is True and evaluator is defined:
+        We save on evaluate, but only if the new model is better than the currently saved one
+        according to the evaluator.
+    2. If evaluator is not defined:
+        We save after the model has been trained.
+    """
+
+    def __init__(self, output_dir: str, evaluator: SentenceEvaluator | None, save_best_model: bool) -> None:
+        super().__init__()
+        self.output_dir = output_dir
+        self.evaluator = evaluator
+        self.save_best_model = save_best_model
+        self.best_metric = None
+
+    def is_better(self, new_metric: float) -> bool:
+        if getattr(self.evaluator, "greater_is_better", True):
+            return new_metric > self.best_metric
+        return new_metric < self.best_metric
+
+    def on_evaluate(
+        self,
+        args: SentenceTransformerTrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        metrics: dict[str, Any],
+        model: SentenceTransformer,
+        **kwargs,
+    ) -> None:
+        if self.evaluator is not None and self.save_best_model:
+            metric_key = getattr(self.evaluator, "primary_metric", "evaluator")
+            for key, value in metrics.items():
+                if key.endswith(metric_key):
+                    if self.best_metric is None or self.is_better(value):
+                        self.best_metric = value
+                        model.save(self.output_dir)
+
+    def on_train_end(
+        self,
+        args: SentenceTransformerTrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: SentenceTransformer,
+        **kwargs,
+    ) -> None:
+        if self.evaluator is None:
+            model.save(self.output_dir)
 
 class SentenceTransformerCL(SentenceTransformer):
     def fit(

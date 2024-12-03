@@ -134,7 +134,7 @@ def finetune(dataset_name, epoch):
     print(len(train_dataloader))
     model.fit(train_dataloader=train_dataloader, epochs=epoch, loss_fct=train_loss, show_progress_bar=True, evaluator=evaluator, evaluation_steps=len(train_dataloader))
 
-    model_name = 'only_positive_pair'
+    model_name = f'{dataset_name}/ce_only_positive_pair'
     model.save(f'outputs/models/{model_name}')
     model = CrossEncoderCL(f'outputs/models/{model_name}')
         
