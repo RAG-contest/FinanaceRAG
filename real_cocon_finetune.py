@@ -1,8 +1,7 @@
 import pandas as pd
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
-from sentence_transformers import losses, InputExample
-from sentence_transformers import models
+from sentence_transformers import losses, InputExample, models
 from transformersCL import SentenceTransformerCL
 import random
 from tqdm import tqdm

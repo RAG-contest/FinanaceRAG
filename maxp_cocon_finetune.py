@@ -1,8 +1,13 @@
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
+
+import torch
+import torch.nn.functional as F
+from torch.optim import Adam, lr_scheduler
 from torch.utils.data import Dataset, DataLoader
-from sentence_transformers import losses, InputExample
-from sentence_transformers import models
+
+from sentence_transformers import losses, InputExample, models
+from transformers import AutoTokenizer
 from transformersCL import SentenceTransformerCL
 import random
 from tqdm import tqdm
@@ -61,15 +66,16 @@ def train(dataset_name):
         def __init__(self, positive_pairs, model_name):
             self.positive_pairs = positive_pairs
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            print(positive_pairs[0])
             self.positive_pairs = {q:[self.tokenizer.decode(c_) for c_ in split_text_into_chunks_with_special_tokens(c, self.tokenizer, 512)] for q, c in self.positive_pairs}
             
         def __len__(self):
             return len(self.positive_pairs.keys())
 
         def __getitem__(self, idx):
-            query = self.positive_pairs.keys()[idx]
+            query = list(self.positive_pairs.keys())[idx]
             positives = self.positive_pairs[query]
+            if len(positives) < 4:
+                positives.extend(["[PAD]" for _ in range(4-len(positives))])
             return {'query': query, 'positives': positives}
 
     class ContrastiveLoss():
@@ -94,21 +100,22 @@ def train(dataset_name):
             query = batch[i]['query']
             positives = batch[i]['positives']
             # 긍정 샘플 추가
-            input_examples.append(InputExample(texts=[query, positive], label=1.0))
+            input_examples.append(InputExample(texts=[query, positives], label=1.0))
             for j in range(batch_size):
                 if i != j:
-                    negative = batch[j]['positives']
+                    negatives = batch[j]['positives']
                     # 부정 샘플 추가
-                    input_examples.append(InputExample(texts=[query, negative], label=0.0))
+                    input_examples.append(InputExample(texts=[query, negatives], label=0.0))
         return input_examples
 
     # 7. 모델 로드
-    # model_name = 'Luyu/co-condenser-marco'
-    # cocon_model = models.Transformer(model_name)
-    # pooling = models.Pooling(cocon_model.get_word_embedding_dimension(), "cls")
-    # model = SentenceTransformerCL(modules=[cocon_model, pooling])
-    model_name = f".models/{dataset_name}/co-condenser-marco"
-    model = SentenceTransformerCL(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_name = 'Luyu/co-condenser-marco'
+    cocon_model = models.Transformer(model_name)
+    pooling = models.Pooling(cocon_model.get_word_embedding_dimension(), "cls")
+    model = SentenceTransformerCL(modules=[cocon_model, pooling], device=device)
+    # model_name = f".models/{dataset_name}/co-condenser-marco"
+    # model = SentenceTransformerCL(model_name)
     
     # 8. 데이터셋 및 DataLoader 생성
     train_dataset = FinanceRAGDataset(positive_pairs, model_name)
@@ -119,20 +126,27 @@ def train(dataset_name):
         
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=in_batch_collate_fn)
 
-    # 9. 손실 함수 정의
+    epochs = 5
+    warmup_steps = int(len(train_dataloader) * epochs * 0.1)
+
+    optimizer = Adam(model.parameters(), lr=2e-5)
+    steps_per_epoch = len(train_dataloader)
+    num_train_steps = int(steps_per_epoch * epochs)
+    scheduler = model._get_scheduler(
+            optimizer, scheduler="WarmupLinear", warmup_steps=warmup_steps, t_total=num_train_steps
+        )
     criterion = ContrastiveLoss()
 
-    # 10. 파인튜닝 설정
-    num_epochs = 5
-    for epoch in range(num_epochs):
+    for epoch in range(epochs):
         epoch_loss = 0.0
-        for batch_idx, batch in tqmd(enumerate(train_dataloader)):
+        for batch_idx, batch in tqdm(enumerate(train_dataloader)):
             # InputExamples 리스트에서 쿼리와 패시지 추출
             queries = [example.texts[0] for example in batch]
             passages = []
             k = 4
             for i in range(k):
-                passages.append([example.texts[1][k] for example in batch])
+                print(len(batch[0].texts[1]), batch[0].texts[1])
+                passages.append([example.texts[1][i] for example in batch])
             labels = torch.tensor([example.label for example in batch]).float().to(device)
             
             q_embed = model.encode(queries)
@@ -140,20 +154,22 @@ def train(dataset_name):
             p_embed = None
             for i in range(k):
                 if p_embed == None:
-                    p_embed = model.encode(passages[k])
+                    p_embed = model.encode(passages[i])
                 else:
-                    p_embed = torch.max(p_embed, model.encode(passages[k]))
+                    p_embed = torch.max(p_embed, model.encode(passages[i]))
             
             optimizer.zero_grad()
             loss = criterion(q_embed, p_embed, labels)
             loss.backward()  # 손실에 대한 역전파
             optimizer.step()
+            scheduler.step()
             
             epoch_loss += loss.item()
         
         average_loss = epoch_loss / len(train_dataloader)
-        print(f'Epoch [{epoch+1}/{num_epochs}] 완료. 평균 손실: {average_loss:.4f}')
-        
+        print(f'Epoch [{epoch+1}/{epochs}] 완료. 평균 손실: {average_loss:.4f}')
+    
+    model.save(f'models/{dataset_name}/fakemp_co-condenser-marco')        
 
 if __name__ == "__main__":
     task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]

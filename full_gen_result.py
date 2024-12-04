@@ -1,25 +1,28 @@
 # FinDER for example.
 # You can use other tasks such as `FinQA`, `TATQA`, etc.
 from financerag.tasks import FinDER, FinQABench,FinanceBench, TATQA, FinQA, ConvFinQA, MultiHiertt
-task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]
-tasks = [FinDER(), FinQABench(), FinanceBench(), TATQA(), FinQA(), ConvFinQA(), MultiHiertt()]
-# task_names = ["MultiHiertt"]
-# tasks = [MultiHiertt()]
+# task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]
+# tasks = [FinDER(), FinQABench(), FinanceBench(), TATQA(), FinQA(), ConvFinQA(), MultiHiertt()]
+task_names = ["FinDER"]
+tasks = [FinDER()]
 
 from sentence_transformers import SentenceTransformer
 from financerag.retrieval import AutoTransformerEncoder, SentenceTransformerEncoder, DenseRetrieval
-from sentence_transformers import CrossEncoder
-from financerag.rerank import CrossEncoderReranker
+from financerag.rerank import MORESReranker
+from mores import MORES
 import torch
 import os
 import pandas as pd
 
-results = []
+reranked_results = []
 bi_model_names_per_task = [
-                        f'models/{task_name}/fakemp_co-condenser-marco_full' for task_name in task_names
+                        f'models/{task_name}/co-condenser-marco_e15' for task_name in task_names
+                            ]
+ce_model_names_per_task = [
+                           f'models/{task_name}/mores+_bart_unfreezed.pt' for task_name in task_names
                           ]
 
-for task, bi_model_name_task in zip(tasks, bi_model_names_per_task):
+for task, task_name, bi_model_name_task, ce_model_name_task in zip(tasks, task_names, bi_model_names_per_task, ce_model_names_per_task):
   # model = SentenceTransformer('intfloat/e5-large-v2')
   # We need to put prefix for e5 models.
   # For more details, see Arxiv paper https://arxiv.org/abs/2212.03533
@@ -31,12 +34,19 @@ for task, bi_model_name_task in zip(tasks, bi_model_names_per_task):
   # Retrieve relevant documents
   print("retrieval")
   ret_result = task.retrieve(retriever=retriever, show_progress_bar=True, top_k=None, maxp=False)
-  
-  task.save_results(output_dir='outputs/')
-  results.append(ret_result)
 
-tasks = [FinDER(), FinQABench(), FinanceBench(), TATQA(), FinQA(), ConvFinQA(), MultiHiertt()][:1]
-# tasks = [MultiHiertt()]
+  model = MORES('facebook/bart-large', 8, 256, 2)
+  model.load_state_dict(torch.load(ce_model_name_task))
+  reranker = MORESReranker(model.to("cuda"))
+  
+  print("rearanking")
+  reranked_results.append(task.rerank(reranker, ret_result, top_k=100, batch_size=64, show_progress_bar=True))
+  task.save_results(output_dir='outputs/')
+  torch.cuda.empty_cache()
+  break
+
+# tasks = [FinDER(), FinQABench(), FinanceBench(), TATQA(), FinQA(), ConvFinQA(), MultiHiertt()][:1]
+tasks = [FinDER()]
 for i, task in enumerate(tasks):
   task_name = task_names[i]
   # 답변 레이블의 30%가 포함된 TSV 파일 로드
@@ -46,7 +56,7 @@ for i, task in enumerate(tasks):
   qrels_dict = df.groupby('query_id').apply(lambda x: dict(zip(x['corpus_id'], x['score']))).to_dict()
   # 검색 또는 재정렬 결과가 `results` 변수에 저장된 경우
   # Recall, Precision, MAP, nDCG와 같은 다양한 지표로 모델 평가
-  print(task.evaluate(qrels_dict, results[i], [1, 5, 10]))
+  print(task.evaluate(qrels_dict, reranked_results[i], [1, 5, 10]))
 
 # Define the path to the 'outputs' directory
 outputs_dir = 'outputs'

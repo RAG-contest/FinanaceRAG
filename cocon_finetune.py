@@ -1,7 +1,7 @@
 import pandas as pd
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForMaskedLM, models
+from transformers import AutoTokenizer, models
 import torch
 import torch.nn as nn
 from sentence_transformers import losses, InputExample

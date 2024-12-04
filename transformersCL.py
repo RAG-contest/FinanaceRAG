@@ -51,11 +51,49 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module, get
 
 from sentence_transformers.model_card import SentenceTransformerModelCardData, generate_model_card
 from sentence_transformers.similarity_functions import SimilarityFunction
-
 logger = logging.getLogger(__name__)
 
 
 class CrossEncoderCL(CrossEncoder):
+    def smart_batching_collate(self, batch: list[InputExample]) -> tuple[BatchEncoding, Tensor]:
+        # parity check
+        try:
+            for i in range(0, len(batch), 4):
+                parity = batch[i:i+4]
+                if not (parity[0][1] == parity[1][1] and parity[1][1] == parity[2][1] and parity[2][1] == parity[3][1]):
+                    raise RuntimeError("parity check failed")
+                batch[i] = batch[i][0]
+                batch[i+1] = batch[i+1][0]
+                batch[i+2] = batch[i+2][0]
+                batch[i+3] = batch[i+3][0]
+                
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            print("parity check failed")     
+            raise RuntimeError("parity check failed")   
+        
+        texts = [[] for _ in range(len(batch[0].texts))]
+        labels = []
+
+        for i, example in enumerate(batch):
+            for idx, text in enumerate(example.texts):
+                texts[idx].append(text.strip())
+
+            if i % 4 == 0: labels.append(example.label)
+        
+        tokenized = self.tokenizer(
+            *texts, padding=True, truncation="longest_first", return_tensors="pt", max_length=self.max_length
+        )
+        labels = torch.tensor(labels, dtype=torch.float if self.config.num_labels == 1 else torch.long).to(
+            self.model.device
+        )
+
+        for name in tokenized:
+            tokenized[name] = tokenized[name].to(self.model.device)
+
+        return tokenized, labels
+    
     def fit(
         self,
         train_dataloader: DataLoader,
@@ -149,11 +187,22 @@ class CrossEncoderCL(CrossEncoder):
             for batch in tqdm(
                 train_dataloader, desc="Iteration", smoothing=0.05, disable=not show_progress_bar
             ):
+                assert len(batch) % 4 == 0
+                actual_batch_size = len(batch)//4
                 features, labels = self.smart_batching_collate(batch)
                 if use_amp:
                     with torch.autocast(device_type=self._target_device.type):
                         model_predictions = self.model(**features, return_dict=True)
                         logits = activation_fct(model_predictions.logits)
+                        
+                        # t는 (B*4) x 2 크기의 텐서입니다.
+                        logits = logits.view(actual_batch_size, 4, 2)  # Step 1: Reshape
+
+                        # Step 2: idx=1 값에서 최대값의 인덱스 찾기
+                        _, indices = torch.max(logits[:, :, 1], dim=1)
+
+                        # Step 3: 최대값에 해당하는 벡터 선택
+                        logits = logits[torch.arange(actual_batch_size), indices, :]
                         if self.config.num_labels == 1:
                             logits = logits.view(-1)
                         loss_value = loss_fct(logits, labels)
@@ -169,6 +218,17 @@ class CrossEncoderCL(CrossEncoder):
                 else:
                     model_predictions = self.model(**features, return_dict=True)
                     logits = activation_fct(model_predictions.logits)
+                    
+                    # t는 (B*4) x 2 크기의 텐서입니다.
+                    logits = logits.view(actual_batch_size, 4, 2)  # Step 1: Reshape
+
+                    # Step 2: idx=1 값에서 최대값의 인덱스 찾기
+                    _, indices = torch.max(logits[:, :, 1], dim=1)
+
+                    # Step 3: 최대값에 해당하는 벡터 선택
+                    logits = logits[torch.arange(actual_batch_size), indices, :]
+                    del indices
+                    
                     if self.config.num_labels == 1:
                         logits = logits.view(-1)
                     loss_value = loss_fct(logits, labels)
@@ -193,6 +253,146 @@ class CrossEncoderCL(CrossEncoder):
 
             if evaluator is not None:
                 self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1, callback)
+
+
+# class MoresCL(CustomCrossEncoder):
+#     def fit(
+#         self,
+#         train_dataloader: DataLoader,
+#         evaluator: SentenceEvaluator = None,
+#         epochs: int = 1,
+#         loss_fct=None,
+#         activation_fct=nn.Identity(),
+#         scheduler: str = "WarmupLinear",
+#         warmup_steps: int = 10000,
+#         optimizer_class: type[Optimizer] = torch.optim.AdamW,
+#         optimizer_params: dict[str, object] = {"lr": 1e-5},
+#         weight_decay: float = 0.01,
+#         evaluation_steps: int = 0,
+#         output_path: str = None,
+#         save_best_model: bool = True,
+#         max_grad_norm: float = 1,
+#         use_amp: bool = False,
+#         callback: Callable[[float, int, int], None] = None,
+#         show_progress_bar: bool = True,
+#     ) -> None:
+#         """
+#         Train the model with the given training objective
+#         Each training objective is sampled in turn for one batch.
+#         We sample only as many batches from each objective as there are in the smallest one
+#         to make sure of equal training with each dataset.
+
+#         Args:
+#             train_dataloader (DataLoader): DataLoader with training InputExamples
+#             evaluator (SentenceEvaluator, optional): An evaluator (sentence_transformers.evaluation) evaluates the model performance during training on held-out dev data. It is used to determine the best model that is saved to disc. Defaults to None.
+#             epochs (int, optional): Number of epochs for training. Defaults to 1.
+#             loss_fct: Which loss function to use for training. If None, will use nn.BCEWithLogitsLoss() if self.config.num_labels == 1 else nn.CrossEntropyLoss(). Defaults to None.
+#             activation_fct: Activation function applied on top of logits output of model.
+#             scheduler (str, optional): Learning rate scheduler. Available schedulers: constantlr, warmupconstant, warmuplinear, warmupcosine, warmupcosinewithhardrestarts. Defaults to "WarmupLinear".
+#             warmup_steps (int, optional): Behavior depends on the scheduler. For WarmupLinear (default), the learning rate is increased from o up to the maximal learning rate. After these many training steps, the learning rate is decreased linearly back to zero. Defaults to 10000.
+#             optimizer_class (Type[Optimizer], optional): Optimizer. Defaults to torch.optim.AdamW.
+#             optimizer_params (Dict[str, object], optional): Optimizer parameters. Defaults to {"lr": 2e-5}.
+#             weight_decay (float, optional): Weight decay for model parameters. Defaults to 0.01.
+#             evaluation_steps (int, optional): If > 0, evaluate the model using evaluator after each number of training steps. Defaults to 0.
+#             output_path (str, optional): Storage path for the model and evaluation files. Defaults to None.
+#             save_best_model (bool, optional): If true, the best model (according to evaluator) is stored at output_path. Defaults to True.
+#             max_grad_norm (float, optional): Used for gradient normalization. Defaults to 1.
+#             use_amp (bool, optional): Use Automatic Mixed Precision (AMP). Only for Pytorch >= 1.6.0. Defaults to False.
+#             callback (Callable[[float, int, int], None], optional): Callback function that is invoked after each evaluation.
+#                 It must accept the following three parameters in this order:
+#                 `score`, `epoch`, `steps`. Defaults to None.
+#             show_progress_bar (bool, optional): If True, output a tqdm progress bar. Defaults to True.
+#         """
+#         # train_dataloader.collate_fn = self.smart_batching_collate
+    
+#         if use_amp:
+#             if is_torch_npu_available():
+#                 scaler = torch.npu.amp.GradScaler()
+#             else:
+#                 scaler = torch.cuda.amp.GradScaler()
+#         self.model.to(self._target_device)
+
+#         if output_path is not None:
+#             os.makedirs(output_path, exist_ok=True)
+
+#         self.best_score = -9999999
+#         num_train_steps = int(len(train_dataloader) * epochs)
+
+#         # Prepare optimizers
+#         param_optimizer = list(self.model.named_parameters())
+
+#         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+#         optimizer_grouped_parameters = [
+#             {
+#                 "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+#                 "weight_decay": weight_decay,
+#             },
+#             {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+#         ]
+
+#         optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
+
+#         if isinstance(scheduler, str):
+#             scheduler = SentenceTransformer._get_scheduler(
+#                 optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=num_train_steps
+#             )
+
+#         if loss_fct is None:
+#             loss_fct = nn.BCEWithLogitsLoss() if self.config.num_labels == 1 else nn.CrossEntropyLoss()
+
+#         skip_scheduler = False
+#         for epoch in trange(epochs, desc="Epoch", disable=not show_progress_bar):
+#             training_steps = 0
+#             self.model.zero_grad()
+#             self.model.train()
+
+#             for batch in tqdm(
+#                 train_dataloader, desc="Iteration", smoothing=0.05, disable=not show_progress_bar
+#             ):
+#                 features, labels = self.smart_batching_collate(batch)
+#                 if use_amp:
+#                     with torch.autocast(device_type=self._target_device.type):
+#                         model_predictions = self.model(**features, return_dict=True)
+#                         logits = activation_fct(model_predictions.logits)
+#                         if self.config.num_labels == 1:
+#                             logits = logits.view(-1)
+#                         loss_value = loss_fct(logits, labels)
+
+#                     scale_before_step = scaler.get_scale()
+#                     scaler.scale(loss_value).backward()
+#                     scaler.unscale_(optimizer)
+#                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+#                     scaler.step(optimizer)
+#                     scaler.update()
+
+#                     skip_scheduler = scaler.get_scale() != scale_before_step
+#                 else:
+#                     model_predictions = self.model(**features, return_dict=True)
+#                     logits = activation_fct(model_predictions.logits)
+#                     if self.config.num_labels == 1:
+#                         logits = logits.view(-1)
+#                     loss_value = loss_fct(logits, labels)
+#                     loss_value.backward()
+#                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+#                     optimizer.step()
+
+#                 optimizer.zero_grad()
+
+#                 if not skip_scheduler:
+#                     scheduler.step()
+
+#                 training_steps += 1
+
+#                 if evaluator is not None and evaluation_steps > 0 and training_steps % evaluation_steps == 0:
+#                     self._eval_during_training(
+#                         evaluator, output_path, save_best_model, epoch, training_steps, callback
+#                     )
+
+#                     self.model.zero_grad()
+#                     self.model.train()
+
+#             if evaluator is not None:
+#                 self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1, callback)
 
 
 from packaging import version
