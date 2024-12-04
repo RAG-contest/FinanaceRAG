@@ -96,12 +96,12 @@ def finetune(rank, world_size, dataset_name, epoch):
 
     def in_batch_collate_fn(batch):
         # i for parity bit
-        new_batch = [(InputExample(texts=[batch[i][0], batch[j][k][1]], label=int(i==j)),(i,j)) for i in range(len(batch)) for j in range(len(batch))for k in range(4)]
+        new_batch = [(InputExample(texts=[batch[i][0], batch[j][k][1]], label=int(i==j)),i*len(batch)+j) for i in range(len(batch)) for j in range(len(batch))for k in range(4)]
         return new_batch
 
     # Define the model
     model_name = 'Capreolus/bert-base-msmarco'  # Or any suitable model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, device_map=device)
     pipeline = CrossEncoderCL(model_name)
     model = pipeline.model.to(device)
     model = DDP(model, device_ids=[rank], output_device=rank)
@@ -119,7 +119,7 @@ def finetune(rank, world_size, dataset_name, epoch):
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=12,
+        batch_size=8,
         num_workers=0,
         pin_memory=True,
         collate_fn=in_batch_collate_fn,
@@ -160,8 +160,8 @@ def finetune(rank, world_size, dataset_name, epoch):
     cleanup()
 
 def main():
-    task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]
-    epoch_num = [10] * len(task_names)
+    task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"][1:]
+    epoch_num = [15] * len(task_names)
 
     world_size = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -183,7 +183,6 @@ def run_finetune(rank, world_size, task_names, epoch_num):
         torch.cuda.empty_cache()
         print(name) if rank == 0 else None
         finetune(rank, world_size, name, epoch)
-        time.sleep(5)
 
 if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"

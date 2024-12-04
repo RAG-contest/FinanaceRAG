@@ -86,7 +86,7 @@ def finetune(dataset_name, epoch):
 
     def in_batch_collate_fn(batch):
         # i for parity bit
-        new_batch = [(InputExample(texts=[batch[i][0], batch[j][k][1]], label=int(i==j)),i) for i in range(len(batch)) for j in range(len(batch))for k in range(4)]
+        new_batch = [(InputExample(texts=[batch[i][0], batch[j][k][1]], label=int(i==j)),i*len(batch)+j) for i in range(len(batch)) for j in range(len(batch))for k in range(4)]
         return new_batch
 
     # Define the model
