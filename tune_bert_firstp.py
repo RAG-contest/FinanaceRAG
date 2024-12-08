@@ -79,19 +79,48 @@ def train(dataset_name):
                     input_examples.append({'label':0.0, 
                                            'query': query, 'doc': negative})#InputExample(texts=[query+"[CLS]"+negative], label=0.0))
         return input_examples
+    
+    # 7. Load the model
+    # ce = CrossEncoder('Capreolus/bert-base-msmarco')
+    # ce_model = ce.model
+    # cb = CustomBert(ce_model.config)
+    # cb.bert.load_state_dict(ce_model.bert.state_dict())
+    # cb.classifier = nn.Linear(768, 1)
+
+    # model = SentenceTransformerCL(modules=[cb], tokenizer_name='Capreolus/bert-base-msmarco')
+        
 
     # 8. Create Dataset and DataLoader
     train_dataset = FinanceRAGDataset(positive_pairs)
-    batch_size = 8  # Adjust as needed
+    batch_size = 16  # Adjust as needed
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=in_batch_collate_fn)
+    
+    # 9. Define the loss function
+    # train_loss = losses.SoftmaxLoss(model=model, sentence_embedding_dimension=768, num_labels=1)
+    
+    # # 10. Fine-tuning settings
+    # num_epochs = 20
+    # warmup_steps = int(len(train_dataloader) * num_epochs * 0.1)  # 10% of train data for warm-up
+    
+    # # 11. Fine-tune the model
+    # model.fit(
+    #     train_objectives=[(train_dataloader, train_loss)],
+    #     epochs=num_epochs,
+    #     warmup_steps=warmup_steps,
+    #     show_progress_bar=True,
+    #     output_path=f'.models/combined/co-condenser-marco_e20'
+    # )
+    
+    # # 12. Save the model
+    # model.save(f'.models/combined/co-condenser-marco_e20')
 
     model = AutoModelForSequenceClassification.from_pretrained(
         "Capreolus/bert-base-msmarco"
     )
     tokenizer = AutoTokenizer.from_pretrained("Capreolus/bert-base-msmarco")
-    model = CustomBert(model.config)
-    model.load_state_dict(model.state_dict())
-    model.train()
+    # model = CustomBert(model.config)
+    # model.load_state_dict(model.state_dict())
+    # model.train()
     
     batchs = {'labels':[], 'queries':[], 'docs':[]}
     for batch in train_dataloader:
@@ -117,7 +146,7 @@ def train(dataset_name):
             query_tokens = tokenizer(query, return_tensors='pt')
             q_len = len(query_tokens['input_ids'][0])
             
-            doc_chunk_len = 512 - q_len + 1
+            doc_chunk_len = 512 - q_len #+ 1
             if doc_chunk_len <= 0:
                 # query가 너무 길어서 doc chunk를 둘 공간이 없음.
                 # 이런 경우 에러 처리하거나 query를 잘라내는 정책 필요
@@ -130,9 +159,10 @@ def train(dataset_name):
                                     padding="max_length", 
                                     truncation=True,
                                     return_overflowing_tokens=True)
+            q=1
             ds = doc_tokens['input_ids'].shape
-            if ds[0] < 4:
-                extra_decoded = tokenizer(["[PAD]"]*(4-ds[0]), 
+            if ds[0] < q:
+                extra_decoded = tokenizer(["[PAD]"]*(q-ds[0]), 
                                             max_length = doc_chunk_len,
                                             return_tensors='pt',
                                             padding="max_length", 
@@ -141,8 +171,8 @@ def train(dataset_name):
                 for key in doc_tokens.keys():
                     doc_tokens[key] = torch.cat([doc_tokens[key], extra_decoded[key]], dim=0)
             
-            for key in ['input_ids', 'attention_mask', 'token_type_ids']:
-                doc_tokens[key] = doc_tokens[key][:,1:]
+            # for key in ['input_ids', 'attention_mask', 'token_type_ids']:
+            #     doc_tokens[key] = doc_tokens[key][:,1:]
                 
             input_ids_list = []
             attention_mask_list = []
@@ -151,7 +181,7 @@ def train(dataset_name):
             q_a = query_tokens['attention_mask'].squeeze(0)
             q_t = query_tokens['token_type_ids'].squeeze(0)
 
-            for k in range(4):                
+            for k in range(q):                
                 d_i = doc_tokens['input_ids'][k]
                 d_a = doc_tokens['attention_mask'][k]
                 d_t = doc_tokens['token_type_ids'][k]
@@ -161,13 +191,13 @@ def train(dataset_name):
                 token_type_ids_list.append(torch.concat([q_t, d_t], dim=0))
                 
             # 한 예제 당 4개 시퀀스를 각각 tensor로 변환
-            input_ids_tensor = torch.concat(input_ids_list, dim=0)
-            attention_mask_tensor = torch.concat(attention_mask_list, dim=0)
-            token_type_ids_tensor = torch.concat(token_type_ids_list, dim=0)
+            # input_ids_tensor = torch.concat(input_ids_list, dim=0)
+            # attention_mask_tensor = torch.concat(attention_mask_list, dim=0)
+            # token_type_ids_tensor = torch.concat(token_type_ids_list, dim=0)
         
-            input_ids_batch.append(input_ids_tensor)
-            attention_mask_batch.append(attention_mask_tensor)
-            token_type_ids_batch.append(token_type_ids_tensor)
+            input_ids_batch.append(input_ids_list[0])
+            attention_mask_batch.append(attention_mask_list[0])
+            token_type_ids_batch.append(token_type_ids_list[0])
 
         # batch 모두 tensor로 스택 (batch_size, 2048) 형태
         return {
@@ -189,8 +219,8 @@ def train(dataset_name):
     training_args = TrainingArguments(
         output_dir="ce_finetune",
         learning_rate=2e-5,
-        per_device_train_batch_size=8,
-        num_train_epochs=30,
+        per_device_train_batch_size=24,
+        num_train_epochs=80,
         weight_decay=0.01,
         max_grad_norm=1.0,
         eval_strategy="no",
@@ -233,14 +263,13 @@ def train(dataset_name):
     
     # 13. Start Training
     trainer.train()
-    torch.save(model.state_dict(), f'models/{dataset_name}/bert_maxp.pt')
+    torch.save(model.state_dict(), f'models/{dataset_name}/bert_firstp.pt')
 
 if __name__ == "__main__":
     # os.environ['WANDB_DISABLED'] = 'false'
-    os.environ['CUDA_VISIBLE_DEVICES'] = "5, 6, 7"
+    os.environ['CUDA_VISIBLE_DEVICES'] = "4,5,6,7"
     task_names = ["FinDER", "FinQABench", "FinanceBench", "TATQA", "FinQA", "ConvFinQA", "MultiHiertt"]
     for task_name in task_names:
         print(task_name)
         train(task_name)
         torch.cuda.empty_cache()
-        

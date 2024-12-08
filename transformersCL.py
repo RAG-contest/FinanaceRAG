@@ -476,6 +476,12 @@ class SaveModelCallback(TrainerCallback):
             model.save(self.output_dir)
 
 class SentenceTransformerCL(SentenceTransformer):
+    def __init__(self, *args, **kwargs):
+        tokenizer_name = kwargs['tokenizer_name']
+        del kwargs['tokenizer_name']
+        super().__init__(*args, **kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        
     def fit(
         self,
         train_objectives: Iterable[tuple[DataLoader, nn.Module]],
